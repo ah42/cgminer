@@ -96,6 +96,7 @@ void applog(int prio, const char *fmt, ...)
 		fflush(stderr);
 	}
 	va_end(ap);
+	fflush(stderr);
 }
 
 static void databuf_free(struct data_buffer *db)
