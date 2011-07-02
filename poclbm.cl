@@ -1,3 +1,6 @@
+// -ck modified kernel taken from Phoenix taken from poclbm, with aspects of
+// phatk and others.
+
 // This file is taken and modified from the public-domain poclbm project, and
 // we have therefore decided to keep it public-domain in Phoenix.
 
@@ -33,10 +36,9 @@ __constant uint K[64] = {
 // primitives.
 
 #define BFI_INTX
+#define BITALIGNX
 
 #ifdef BFI_INT
-
-#define BITALIGN
 	// Well, slight problem... It turns out BFI_INT isn't actually exposed to
 	// OpenCL (or CAL IL for that matter) in any way. However, there is 
 	// a similar instruction, BYTE_ALIGN_INT, which is exposed to OpenCL via
@@ -48,7 +50,7 @@ __constant uint K[64] = {
 	#define ch(x, y, z) amd_bytealign(x, y, z)
 	
 	// Ma can also be implemented in terms of BFI_INT...
-	#define Ma(x, y, z) amd_bytealign((y), (x | z), (z & x))
+	#define Ma(x, y, z) amd_bytealign( (z^x), (y), (x) )
 #else
 	#define ch(x, y, z) (z ^ (x & (y ^ z)))
 	#define Ma(x, y, z) ((x & z) | (y & (x | z)))
@@ -77,12 +79,12 @@ __kernel void search(	const uint state0, const uint state1, const uint state2, c
 	u W[24];
 	u Vals[8];
 	u nonce;
-	uint it;
+	uint it = get_local_id(0);
 
 #ifdef VECTORS4
-	nonce = ((base >> 2) + (get_global_id(0))<<2) + (uint4)(0, 1, 2, 3);
+	nonce = base + (get_global_id(0)<<2) + (uint4)(0, 1, 2, 3);
 #elif defined VECTORS2
-	nonce = ((base >> 1) + (get_global_id(0))<<1) + (uint2)(0, 1);
+	nonce = base + (get_global_id(0)<<1) + (uint2)(0, 1);
 #else
 	nonce = base + get_global_id(0);
 #endif
@@ -625,59 +627,70 @@ __kernel void search(	const uint state0, const uint state1, const uint state2, c
 
 	Vals[7]+=0x5be0cd19U;
 
+#define MAXBUFFERS (4 * 512)
+
 #if defined(VECTORS4) || defined(VECTORS2)
 	if (Vals[7].x == 0)
 	{
-		for (it = 0; it != 127; it++) {
-			if (!output[it]) {
-				output[it] = nonce.x;
-				output[127] = 1;
-				break;
+		// Unlikely event there is something here already !
+		if (output[it]) {
+			for (it = 0; it < MAXBUFFERS; it++) {
+				if (!output[it])
+					break;
 			}
 		}
+		output[it] = nonce.x;
+		output[MAXBUFFERS] = 1;
 	}
 	if (Vals[7].y == 0)
 	{
-		for (it = 0; it != 127; it++) {
-			if (!output[it]) {
-				output[it] = nonce.y;
-				output[127] = 1;
-				break;
+		it += 512;
+		if (output[it]) {
+			for (it = 0; it < MAXBUFFERS; it++) {
+				if (!output[it])
+					break;
 			}
 		}
+		output[it] = nonce.y;
+		output[MAXBUFFERS] = 1;
 	}
 #ifdef VECTORS4
 	if (Vals[7].z == 0)
 	{
-		for (it = 0; it != 127; it++) {
-			if (!output[it]) {
-				output[it] = nonce.z;
-				output[127] = 1;
-				break;
+		it += 1024;
+		if (output[it]) {
+			for (it = 0; it < MAXBUFFERS; it++) {
+				if (!output[it])
+					break;
 			}
 		}
+		output[it] = nonce.z;
+		output[MAXBUFFERS] = 1;
 	}
 	if (Vals[7].w == 0)
 	{
-		for (it = 0; it != 127; it++) {
-			if (!output[it]) {
-				output[it] = nonce.w;
-				output[127] = 1;
-				break;
+		it += 1536;
+		if (output[it]) {
+			for (it = 0; it < MAXBUFFERS; it++) {
+				if (!output[it])
+					break;
 			}
 		}
+		output[it] = nonce.w;
+		output[MAXBUFFERS] = 1;
 	}
 #endif
 #else
 	if (Vals[7] == 0)
 	{
-		for (it = 0; it != 127; it++) {
-			if (!output[it]) {
-				output[it] = nonce;
-				output[127] = 1;
-				break;
+		if (output[it]) {
+			for (it = 0; it < MAXBUFFERS; it++) {
+				if (!output[it])
+					break;
 			}
 		}
+		output[it] = nonce;
+		output[MAXBUFFERS] = 1;
 	}
 #endif
 }

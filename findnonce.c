@@ -9,9 +9,12 @@
 
 #include <stdio.h>
 #include <inttypes.h>
+#include <pthread.h>
+#include <string.h>
 
 #include "ocl.h"
 #include "findnonce.h"
+#include "miner.h"
 
 const uint32_t SHA256_K[64] = {
 	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
@@ -84,15 +87,16 @@ void precalc_hash(dev_blk_ctx *blk, uint32_t *state, uint32_t *data) {
 	blk->ntime = data[1];
 	blk->nbits = data[2];
 
-	blk->fW0 = data[0] + (rotr(data[1], 7) ^ rotr(data[1], 18) ^ (data[1] >> 3));
-	blk->fW1 = data[1] + (rotr(data[2], 7) ^ rotr(data[2], 18) ^ (data[2] >> 3)) + 0x01100000;
+	blk->W16 = blk->fW0 = data[0] + (rotr(data[1], 7) ^ rotr(data[1], 18) ^ (data[1] >> 3));
+	blk->W17 = blk->fW1 = data[1] + (rotr(data[2], 7) ^ rotr(data[2], 18) ^ (data[2] >> 3)) + 0x01100000;
+	blk->W2 = data[2];
 	blk->fW2 = data[2] + (rotr(blk->fW0, 17) ^ rotr(blk->fW0, 19) ^ (blk->fW0 >> 10));
 	blk->fW3 = 0x11002000 + (rotr(blk->fW1, 17) ^ rotr(blk->fW1, 19) ^ (blk->fW1 >> 10));
 	blk->fW15 = 0x00000280 + (rotr(blk->fW0, 7) ^ rotr(blk->fW0, 18) ^ (blk->fW0 >> 3));
 	blk->fW01r = blk->fW0 + (rotr(blk->fW1, 7) ^ rotr(blk->fW1, 18) ^ (blk->fW1 >> 3));
 
-	blk->fcty_e = E + (rotr(B, 6) ^ rotr(B, 11) ^ rotr(B, 25)) + (D ^ (B & (C ^ D))) + 0xe9b5dba5;
-	blk->fcty_e2 = (rotr(F, 2) ^ rotr(F, 13) ^ rotr(F, 22)) + ((F & G) | (H & (F | G)));
+	blk->PreVal4 = blk->fcty_e = E + (rotr(B, 6) ^ rotr(B, 11) ^ rotr(B, 25)) + (D ^ (B & (C ^ D))) + 0xe9b5dba5;
+	blk->T1 = blk->fcty_e2 = (rotr(F, 2) ^ rotr(F, 13) ^ rotr(F, 22)) + ((F & G) | (H & (F | G)));
 }
 
 #define P(t) (W[(t)&0xF] = W[(t-16)&0xF] + (rotate(W[(t-15)&0xF], 25) ^ rotate(W[(t-15)&0xF], 14) ^ (W[(t-15)&0xF] >> 3)) + W[(t-7)&0xF] + (rotate(W[(t-2)&0xF], 15) ^ rotate(W[(t-2)&0xF], 13) ^ (W[(t-2)&0xF] >> 10)))
@@ -131,13 +135,41 @@ void precalc_hash(dev_blk_ctx *blk, uint32_t *state, uint32_t *data) {
   R(E, F, G, H, A, B, C, D, P(u+4), SHA256_K[u+4]); \
   R(D, E, F, G, H, A, B, C, P(u+5), SHA256_K[u+5])
 
-void postcalc_hash(struct thr_info *thr, dev_blk_ctx *blk, struct work *work, uint32_t start)
+struct pc_data {
+	struct thr_info *thr;
+	struct work *work;
+	uint32_t res[MAXBUFFERS];
+	pthread_t pth;
+};
+
+static void *postcalc_hash(void *userdata)
 {
+	struct pc_data *pcd = (struct pc_data *)userdata;
+	struct thr_info *thr = pcd->thr;
+	dev_blk_ctx *blk = &pcd->work->blk;
+	struct work *work = pcd->work;
+	uint32_t start = 0;
+
 	cl_uint A, B, C, D, E, F, G, H;
 	cl_uint W[16];
 	cl_uint nonce;
-	cl_uint best_g = ~0;
-	uint32_t end = start + 1026;
+	cl_uint best_g;
+	uint32_t end;
+	int entry = 0;
+
+cycle:
+	while (entry < MAXBUFFERS) {
+		if (pcd->res[entry]) {
+			start = pcd->res[entry++];
+			break;
+		}
+		entry++;
+	}
+	if (entry == MAXBUFFERS)
+		goto out;
+
+	best_g = ~0;
+	end = start + 1026;
 
 	for (nonce = start; nonce != end; nonce+=1) {
 		A = blk->cty_a; B = blk->cty_b;
@@ -172,7 +204,7 @@ void postcalc_hash(struct thr_info *thr, dev_blk_ctx *blk, struct work *work, ui
 		if (unlikely(H == 0xA41F32E7)) {
 			if (unlikely(submit_nonce(thr, work, nonce) == false)) {
 				applog(LOG_ERR, "Failed to submit work, exiting");
-				goto out;
+				break;
 			}
 
 			G += 0x1f83d9ab;
@@ -182,7 +214,40 @@ void postcalc_hash(struct thr_info *thr, dev_blk_ctx *blk, struct work *work, ui
 				best_g = G;
 		}
 	}
+
+	if (unlikely(best_g == ~0)) {
+		if (opt_debug)
+			applog(LOG_DEBUG, "No best_g found! Error in OpenCL code?");
+		hw_errors++;
+		thr->cgpu->hw_errors++;
+	}
+	if (entry < MAXBUFFERS)
+		goto cycle;
 out:
-	if (unlikely(best_g == ~0))
-		applog(LOG_ERR, "No best_g found! Error in OpenCL code?");
+	pthread_detach(pthread_self());
+	free(pcd);
+	return NULL;
+}
+
+void postcalc_hash_async(struct thr_info *thr, struct work *work, uint32_t *res)
+{
+	struct pc_data *pcd = malloc(sizeof(struct pc_data));
+	if (unlikely(!pcd)) {
+		applog(LOG_ERR, "Failed to malloc pc_data in postcalc_hash_async");
+		return;
+	}
+	pcd->work = calloc(1, sizeof(struct work));
+	if (unlikely(!pcd->work)) {
+		applog(LOG_ERR, "Failed to malloc work in postcalc_hash_async");
+		return;
+	}
+
+	pcd->thr = thr;
+	memcpy(pcd->work, work, sizeof(struct work));
+	memcpy(&pcd->res, res, BUFFERSIZE);
+
+	if (pthread_create(&pcd->pth, NULL, postcalc_hash, (void *)pcd)) {
+		applog(LOG_ERR, "Failed to create postcalc_hash thread");
+		return;
+	}
 }
